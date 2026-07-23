@@ -8,8 +8,6 @@ class VisualizadorCCO:
     def __init__(self, arquivo, raio_tubo=None):
 
         # Malha original (linhas) convertida em tubos (superfícies com espessura)
-        # Isso é necessário porque sombreamento (Flat/Gouraud/Phong) só faz
-        # diferença visual em superfícies com normais, não em linhas puras.
         if not os.path.isfile(arquivo):
             raise FileNotFoundError(
                 f"Arquivo nao encontrado: '{arquivo}'.\n"
@@ -25,47 +23,16 @@ class VisualizadorCCO:
                 f"Verifique se e um .vtk valido. Detalhe: {erro}"
             )
 
-        # Guarda a malha original de LINHAS (antes de virar tubo). É ela que
-        # tem a topologia "crua" do modelo CCO (pontos e segmentos), usada
-        # pelo Módulo 1 (Leitura e Representação Geométrica) para calcular
-        # número de pontos, número de segmentos e faixa de raio exigidos
-        # no relatório. Depois de tubular, esses números mudam (o VTK gera
-        # muito mais pontos/células só para desenhar a superfície do tubo),
-        # então não podem ser lidos a partir de self.mesh.
         self.malha_linhas = malha_linhas
         self.arquivo = arquivo
-
-        # Módulo 1 - Leitura e Representação Geométrica: calcula as
-        # estatísticas exigidas no relatório (número de pontos, número de
-        # segmentos, menor/maior raio) e já imprime no console assim que o
-        # modelo é carregado.
         self.info_modelo = self.calcular_info_modelo()
         self.imprimir_info_modelo()
-
-        # O tube() do PyVista só consegue variar a ESPESSURA GEOMÉTRICA do
-        # tubo (não só a cor) se o atributo escalar estiver em point_data.
-        # No arquivo original, "raio" vem em cell_data (um valor por
-        # segmento). Convertemos aqui para point_data (interpolando o
-        # valor entre os pontos vizinhos) só para essa finalidade -
-        # continuamos usando o valor original de cell_data para as
-        # estatísticas do Módulo 1 (mais fiel ao dado bruto).
         self.malha_linhas_pts = malha_linhas.cell_data_to_point_data()
 
-        # Se o raio não for informado, calcula proporcionalmente ao tamanho
-        # da árvore (0.3% da diagonal da bounding box). Esse valor agora é
-        # usado como o raio MÍNIMO do tubo (não mais um raio fixo igual
-        # para toda a árvore) - evita "bolhas" gigantes em árvores
-        # pequenas ou tubos invisíveis em árvores grandes.
         if raio_tubo is None:
             raio_tubo = malha_linhas.length * 0.0015
 
-        # Módulo 1 - representação por tubos com espessura geométrica real:
-        # em vez de um raio de desenho igual para todos os segmentos, o
-        # tube() varia a espessura de cada trecho proporcionalmente ao
-        # valor do atributo "raio" daquele ponto (scalars="raio").
-        # radius_factor controla a razão entre o tubo mais grosso e o mais
-        # fino da árvore inteira (aqui, até 12x mais grosso no ponto de
-        # maior raio do que no de menor raio).
+        # Módulo 1
         self.mesh = self.malha_linhas_pts.tube(
             radius=raio_tubo,
             scalars="raio",
@@ -74,83 +41,40 @@ class VisualizadorCCO:
         )
 
         self.plotter = pv.Plotter(window_size=(1200, 800))
-
         self.plotter.set_background("white")
 
-        # Modulo 8 - registra o observador de profundidade (ver metodo
-        # configurar_teste_profundidade) uma unica vez aqui. Ele fica
-        # "ouvindo" o RenderWindow e roda antes de CADA frame desenhado,
-        # entao nao precisa ser recriado a cada atualizar_cena().
+        # Modulo 8 - registra o observador de profundidade
         self.configurar_teste_profundidade()
 
-        # Modulo 9 - a animacao de rotacao automatica NAO usa o timer
-        # nativo do VTK (add_timer_event/CreateRepeatingTimer). Em algumas
-        # instalacoes/plataformas (observado no Windows/Git Bash), esse
-        # timer nunca dispara de verdade: o toggle troca o estado e
-        # imprime normalmente, mas a arvore nunca gira - mesmo registrando
-        # o timer so depois do interactor inicializado. Por isso usamos,
-        # em vez disso, um LACO MANUAL de atualizacao dentro de executar()
-        # (padrao "interactive_update" do PyVista): a cada iteracao do
-        # loop, se self.animando estiver ligado, avancamos o angulo e
-        # re-renderizamos manualmente, sem depender de timers do VTK.
-
+        # Modulo 9
         self.clip = False
         self.eixo_clip = "x"  # 'x' | 'y' | 'z'
         self.interpolacao = "gouraud"  # 'flat' | 'gouraud' | 'phong'
 
-        # Modulo 8 - Remocao de Superficies Escondidas: liga/desliga o
-        # teste de profundidade (Z-buffer) da GPU, para permitir comparar
-        # visualmente a cena COM remocao de superficies escondidas (padrao)
-        # e SEM ela (tecla 8). Ver configurar_teste_profundidade() logo
-        # abaixo para detalhes de como isso e feito.
+        # Modulo 8 - Remocao de Superficies Escondidas
         self.sem_profundidade = False
 
-        # Módulo 2 - Cores e Atributos Visuais: lista de mapas de cores
-        # (colormaps) que podem ser alternados em tempo real com a tecla
-        # M. Isso também é reaproveitado como o "recurso inovador" do
-        # Módulo 9 (interface para trocar mapa de cores).
+        # Módulo 2 - Cores e Atributos Visuais
         self.mapas_cores = ["jet", "viridis", "plasma", "coolwarm", "rainbow"]
         self.indice_mapa_cor = 0
 
-        # Módulo 3 - Transformações Geométricas: estado atual de
-        # translação (deslocamento em X, Y, Z), rotação (ângulos em graus
-        # em torno de X, Y, Z) e escala (fator uniforme) aplicados ao
-        # modelo.
-        #
-        # ROTAÇÃO PADRÃO: no arquivo .vtk original, o vaso de maior raio
-        # (a "raiz" da árvore) fica no topo e os ramos finos se abrem para
-        # baixo - o que visualmente parece "de cabeça para baixo" para
-        # quem espera uma árvore com o tronco embaixo. As coordenadas do
-        # CCO não têm relação com "para cima/para baixo" do mundo real,
-        # então giramos 180° em X só por preferência visual, deixando a
-        # raiz embaixo tanto ao abrir o programa quanto ao apertar "0".
+        # Módulo 3 - Transformações Geométricas
         self.rotacao_padrao = [180.0, 0.0, 0.0]
         self.translacao = [0.0, 0.0, 0.0]
         self.rotacao = list(self.rotacao_padrao)
         self.escala = 1.0
-
-        # Tamanho de cada "passo" de transformação, proporcional ao
-        # tamanho da árvore - assim o incremento faz sentido tanto para
-        # árvores pequenas quanto grandes, sem precisar ajustar na mão.
         self.passo_translacao = malha_linhas.length * 0.05
         self.passo_rotacao = 10.0  # graus por tecla pressionada
         self.fator_escala = 1.1    # 10% de aumento/reducao por tecla
 
         # Modulo 9 (2a inovacao) - Animacao de rotacao automatica: gira o
-        # modelo continuamente em torno do eixo Y, independente da rotacao
-        # manual do Modulo 3 (por isso o angulo fica numa variavel PROPRIA,
-        # em vez de mexer direto em self.rotacao - assim dar Play/Pause na
-        # animacao nao interfere com a pose que o usuario ajustou a mao,
-        # nem e apagado por um "resetar transformacoes").
+        # modelo continuamente em torno do eixo Y
         self.animando = False
         self.angulo_animacao = 0.0
         self.velocidade_animacao = 1.5  # graus por frame (~25 fps)
         self.ator_arvore = None  # referencia ao ator atual (ver atualizar_cena)
 
-        # A luz é configurada dentro de atualizar_cena() (não aqui),
-        # pois precisa ser recriada toda vez que a cena é redesenhada.
         self.atualizar_cena()
-
         self.configurar_teclado()
 
     # ----------------------------------
@@ -170,15 +94,9 @@ class VisualizadorCCO:
         """
 
         malha = self.malha_linhas
-
         n_pontos = malha.n_points
         n_segmentos = malha.n_cells
-
-        # Procura um array chamado (ou parecido com) "raio"/"radius" em
-        # cell_data primeiro (caso mais comum nos modelos fornecidos) e,
-        # se não achar, em point_data.
         nomes_possiveis = ["raio", "radius", "Raio", "Radius", "RADIUS"]
-
         array_raio = None
         origem_raio = None
 
@@ -211,9 +129,6 @@ class VisualizadorCCO:
             "raio_max": raio_max,
             "raio_medio": raio_medio,
             "origem_raio": origem_raio,
-            # Comprimento total = soma do comprimento de todos os segmentos.
-            # Serve tanto para o Módulo 1 (descrever a estrutura geométrica)
-            # quanto pode ser reaproveitado depois no Módulo 9.
             "comprimento_total": float(malha.compute_cell_sizes(
                 length=True, area=False, volume=False
             )["Length"].sum()),
@@ -251,19 +166,7 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
             f"Y[{ymin:.4f}, {ymax:.4f}]  "
             f"Z[{zmin:.4f}, {zmax:.4f}]"
         )
-        print(
-            "\nEstrutura: a arvore e representada como um grafo aciclico "
-            "conectado (uma raiz e ramificacoes sucessivas), onde cada "
-            "celula do tipo 'linha' liga dois pontos consecutivos e "
-            "corresponde a um segmento de vaso sanguineo. O atributo de "
-            "raio associado a cada segmento e usado no Modulo 2 para "
-            "colorir a arvore proporcionalmente a espessura do vaso, e "
-            "geometricamente para gerar os tubos (superficies) exibidos "
-            "na cena.\n"
-        )
 
-        # Reforca a exibicao imediata no terminal (evita que a mensagem
-        # fique presa em buffer ate a proxima interacao com a janela).
         sys.stdout.flush()
 
     def salvar_info_modelo(self, caminho="imagens/info_modelo.txt"):
@@ -303,22 +206,13 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
 
     def configurar_luz(self):
 
-        # Luz "headlight": acompanha sempre a posição da câmera, garantindo
-        # que a árvore fique bem iluminada em QUALQUER ângulo de vista
-        # (frontal, lateral, superior, isométrica). Sem isso, ao girar a
-        # câmera, partes da árvore que ficam de costas para uma luz fixa
-        # no espaço aparecem escuras — deixando a claridade inconsistente
-        # entre as diferentes vistas da Parte A.
+        # Luz "headlight": acompanha sempre a posição da câmera
         self.luz_camera = pv.Light(
             light_type="headlight",
             color="white",
             intensity=0.6,
         )
 
-        # Luz principal fixa na cena (requisito mínimo da Parte C: pelo
-        # menos uma fonte de luz configurada). É ela que gera sombras e
-        # reflexos direcionais reais, permitindo diferenciar visualmente
-        # os modos de sombreamento Flat / Gouraud / Phong.
         self.luz = pv.Light(
             position=(1, 1, 1),
             focal_point=(0, 0, 0),
@@ -335,30 +229,6 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
     # ----------------------------------
 
     def configurar_teste_profundidade(self):
-        """Registra um observador de baixo nivel no RenderWindow que roda
-        imediatamente ANTES de cada frame ser desenhado pela GPU.
-
-        O PyVista/VTK ja faz remocao de superficies escondidas nativamente
-        em qualquer cena 3D, usando o Z-BUFFER da placa de video: a cada
-        pixel, a GPU testa a distancia (profundidade) de cada fragmento
-        candido e so desenha o mais proximo da camera (glDepthFunc =
-        GL_LEQUAL, que e o padrao usado internamente pelo VTK). E por isso
-        que os tubos da arvore, mesmo se cruzando o tempo todo, aparecem
-        corretamente sobrepostos - o de tras nunca "vaza" por cima do que
-        esta na frente.
-
-        Este metodo permite alternar esse teste em tempo real (tecla 8):
-        - LIGADO  (GL_LEQUAL): comportamento padrao, com remocao correta
-          de superficies escondidas.
-        - DESLIGADO (GL_ALWAYS): qualquer fragmento passa no teste de
-          profundidade, entao o que fica visivel na tela deixa de
-          depender da distancia real a camera e passa a depender so da
-          ORDEM em que a geometria foi enviada para desenho - produzindo
-          sobreposicoes visualmente incorretas, especialmente nos varios
-          cruzamentos de galhos do modelo CCO. E util para gerar a
-          comparacao "com/sem Z-buffer" pedida no relatorio.
-        """
-
         GL_LEQUAL = 0x0203  # padrao usado internamente pelo VTK
         GL_ALWAYS = 0x0207  # desativa o teste (tudo passa)
 
@@ -405,36 +275,15 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
         # luz e os modos Flat/Gouraud/Phong deixam de ter diferença visual.
         self.configurar_luz()
 
-        # IMPORTANTE: usar .copy(deep=False) em vez de "mesh = self.mesh".
-        # O PyVista, quando smooth_shading=True, calcula normais e as
-        # grava PERMANENTEMENTE no point_data da malha passada
-        # (add_mesh(..., smooth_shading=True) -> compute_normals(inplace=True)).
-        # Sem essa cópia, self.mesh ficaria "contaminado" com normais suaves
-        # já na primeira renderização em Gouraud/Phong, e o modo Flat nunca
-        # mais conseguiria voltar a ficar realmente facetado (o VTK continuaria
-        # usando as normais antigas, gravadas ali dentro, mesmo com
-        # smooth_shading=False).
         mesh = self.mesh.copy(deep=False)
 
-        # Remove normais eventualmente herdadas da cópia rasa acima, para
-        # garantir que cada troca de modo (F/G/H) parta de um estado limpo
-        # e o Flat realmente apareça facetado.
         if "Normals" in mesh.point_data:
             mesh.point_data.remove("Normals")
 
         if self.clip:
             mesh = mesh.clip(normal=self.eixo_clip)
 
-        # Módulo 2 - Cores e Atributos Visuais: em vez de uma cor sólida
-        # fixa, colorimos cada segmento (tubo) proporcionalmente ao seu
-        # raio real (atributo "raio", vindo de cell_data). O tube() do
-        # PyVista propaga automaticamente esse atributo da malha de linhas
-        # original para a malha de tubos, então basta usar scalars="raio".
-        #
-        # clim é fixado com o raio mínimo/máximo do MODELO INTEIRO (não da
-        # malha já recortada pelo clipping), para que a escala de cores
-        # não mude quando o usuário ativa o clipping - assim a mesma cor
-        # sempre representa o mesmo raio, em qualquer estado da cena.
+        # Módulo 2 - Cores e Atributos Visuais
         raio_min = self.info_modelo["raio_min"]
         raio_max = self.info_modelo["raio_max"]
 
@@ -468,25 +317,9 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
         elif self.interpolacao == "phong":
             ator.prop.SetInterpolationToPhong()
 
-        # Guarda a referencia do ator atual - necessaria para a animacao
-        # (Modulo 9) poder girar o modelo a cada frame SEM precisar
-        # reconstruir a cena inteira (o que seria lento demais a ~25 fps).
         self.ator_arvore = ator
-
-        # Módulo 3 - Transformações Geométricas + Módulo 9 - Animação:
-        # aplica translação, rotação (manual + automática) e escala
-        # diretamente no ATOR (não na geometria da malha). Ver
-        # _aplicar_transformacoes_no_ator() para detalhes.
-        #
-        # IMPORTANTE: como self.plotter.clear() (no início deste método)
-        # apaga o ator antigo, isso precisa ser reaplicado AQUI, toda vez
-        # que a cena é redesenhada - senão a árvore voltaria a
-        # posição/rotação/escala original a cada troca de vista, cor,
-        # sombreamento, etc.
         self._aplicar_transformacoes_no_ator()
-
         self.plotter.add_axes()
-
         self.plotter.render()
 
     # ----------------------------------
@@ -548,13 +381,6 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
         # Reset das transformações
         self.plotter.add_key_event("0", self.resetar_transformacoes)
 
-        # O VTK registra atalhos de teclado padrão por baixo dos panos
-        # (ex: '3' alterna renderização estéreo, 'f' voa até o ponto sob
-        # o cursor, 'c' alterna entre manipular câmera/ator com o mouse).
-        # Esses atalhos disparam JUNTO com os nossos e causam efeitos
-        # visuais indesejados (como o fundo magenta em modo estéreo).
-        # Removemos os observadores padrão de CharEvent para que apenas
-        # os atalhos definidos acima funcionem.
         self.plotter.iren.interactor.RemoveObservers("CharEvent")
 
     # ----------------------------------
@@ -602,14 +428,8 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
         self.plotter.render()
 
     def toggle_animacao(self):
-        """Liga/pausa a animacao de rotacao automatica - tecla A.
-
-        Recurso inovador do Modulo 9 (2a inovacao do grupo, junto com a
-        troca de mapa de cores do Modulo 2): demonstra a arvore girando
-        continuamente, sem precisar de interacao manual do usuario -
-        util especialmente para a apresentacao oral e para gravar um
-        video/GIF da visualizacao.
-        """
+        #Liga/pausa a animacao de rotacao automatica - tecla A.
+        
 
         self.animando = not self.animando
 
@@ -700,7 +520,6 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
     def ortografica(self):
 
         self.plotter.enable_parallel_projection()
-
         self.plotter.render()
 
         print("Projecao Ortografica")
@@ -708,7 +527,6 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
     def perspectiva(self):
 
         self.plotter.disable_parallel_projection()
-
         self.plotter.render()
 
         print("Projecao Perspectiva")
@@ -722,16 +540,9 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
         return self.mapas_cores[self.indice_mapa_cor]
 
     def proximo_mapa_cor(self):
-        """Alterna para o proximo mapa de cores da lista (tecla M).
-
-        Isso atende ao Modulo 2 (mapa de cores continuo) permitindo
-        comparar visualmente diferentes paletas, e tambem serve como o
-        recurso inovador do Modulo 9 (interface para trocar mapa de
-        cores).
-        """
-
+        #Alterna para o proximo mapa de cores da lista (tecla M).
+        
         self.indice_mapa_cor = (self.indice_mapa_cor + 1) % len(self.mapas_cores)
-
         self.atualizar_cena()
 
         print("Mapa de cores:", self.mapa_cor_atual)
@@ -743,7 +554,6 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
     def flat(self):
 
         self.interpolacao = "flat"
-
         self.atualizar_cena()
 
         print("Sombreamento: Flat")
@@ -751,7 +561,6 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
     def gouraud(self):
 
         self.interpolacao = "gouraud"
-
         self.atualizar_cena()
 
         print("Sombreamento: Gouraud")
@@ -759,7 +568,6 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
     def phong(self):
 
         self.interpolacao = "phong"
-
         self.atualizar_cena()
 
         print("Sombreamento: Phong")
@@ -771,7 +579,6 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
     def toggle_clip(self):
 
         self.clip = not self.clip
-
         self.atualizar_cena()
 
         print("Clipping:", self.clip, "| Eixo:", self.eixo_clip.upper())
@@ -792,11 +599,8 @@ MODULO 1 - LEITURA E REPRESENTACAO GEOMETRICA
     def salvar(self):
 
         nome = input("Nome da imagem: ")
-
         caminho = f"imagens/{nome}.png"
-
         self.plotter.screenshot(caminho)
-
         print("Imagem salva:", caminho)
 
     # ----------------------------------
@@ -867,14 +671,6 @@ Botao do meio -> Pan
         # forma confiavel), usamos show(interactive_update=True). Isso
         # abre a janela SEM bloquear o programa, e devolve o controle
         # para o laco abaixo, que roda ate a janela ser fechada.
-        #
-        # A cada iteracao do laco (a ~25 fps):
-        #   - se a animacao estiver ligada (tecla A), avancamos o angulo
-        #     de rotacao e re-renderizamos via _passo_animacao();
-        #   - senao, so processamos os eventos pendentes da janela
-        #     (mouse, teclado) com plotter.update(), para a interface
-        #     continuar respondendo normalmente mesmo com a animacao
-        #     pausada.
         #
         # O laco termina sozinho quando a janela e fechada: nesse ponto,
         # qualquer chamada a plotter.update()/render() passa a falhar
